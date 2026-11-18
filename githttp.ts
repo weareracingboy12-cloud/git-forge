@@ -1,17 +1,19 @@
-// git smart HTTP: info/refs advertisements, v2 ls-refs and fetch, v0 fetch,
-// and v0 receive-pack. The protocol rules this file implements:
+// git smart HTTP: info/refs advertisements, v2 ls-refs and fetch, v0
+// fetch, and v0 receive-pack. The protocol rules this file answers:
 //
-//   upload-pack honours Git-Protocol: version=2 (a v2 advertisement: `version
-//   2` plus capability lines, including fetch, ls-refs=unborn and
-//   object-format=sha1); without it, a v0 advertisement (the `# service=`
-//   preamble, ref lines, the first carrying the capabilities after a NUL).
-//   receive-pack is v0 only, advertising report-status, side-band-64k and
-//   delete-refs.
-//   ls-refs answers HEAD with its symref target, peels annotated tags, and
-//   honours ref-prefix filtering (HEAD is only listed without a prefix).
-//   fetch sends only the objects the client does not hold: the walk stops at
-//   haves and at shallow boundaries, and a deepen limit cuts the history at
-//   exactly that many generations, naming the new boundary in shallow-info.
+//   upload-pack honours Git-Protocol: version=2 (a v2 advertisement:
+//   `version 2` plus capability lines, including fetch, ls-refs=unborn
+//   and object-format=sha1); without it, a v0 advertisement (the
+//   `# service=` preamble, ref lines, the first carrying the
+//   capabilities after a NUL). receive-pack is v0 only, advertising
+//   report-status, side-band-64k and delete-refs.
+//   ls-refs answers HEAD with its symref target, peels annotated tags,
+//   and honours ref-prefix filtering (HEAD is only listed without a
+//   prefix).
+//   fetch sends only the objects the client does not hold: the walk
+//   stops at haves and at shallow boundaries, and a deepen limit cuts
+//   the history at exactly that many generations, naming the new
+//   boundary in shallow-info.
 //   receive-pack is fast-forward only; a refused ref gets
 //   `ng <ref> non-fast-forward` and does not move, while the pack still
 //   unpacks. The report travels in sideband band 1 when negotiated.
@@ -34,17 +36,21 @@ import { jsonResult, notFound, type HttpResult } from './httputil.ts';
 
 const AGENT = 'git-forge/1.0';
 
-const UPLOAD_V0_CAPS = 'side-band-64k multi_ack_detailed thin-pack ofs-delta shallow symref=HEAD:refs/heads/main agent=git-forge/1.0';
-const RECEIVE_V0_CAPS = 'report-status side-band-64k delete-refs ofs-delta agent=git-forge/1.0';
+const UPLOAD_V0_CAPS =
+  'side-band-64k multi_ack_detailed thin-pack ofs-delta shallow symref=HEAD:refs/heads/main agent=git-forge/1.0';
+const RECEIVE_V0_CAPS =
+  'report-status side-band-64k delete-refs ofs-delta agent=git-forge/1.0';
 
-/** The refs of a repository, sorted by name, with peeled tag targets. */
+/** One ref of a repository, with its peeled tag target when it is an
+ * annotated tag. */
 interface ListedRef {
   name: string;
   oid: string;
   peeled?: string;
 }
 
-function listRefs(repo: Repo): ListedRef[] {
+/** The refs of a repository, sorted by name, with peeled tag targets. */
+function collectRefs(repo: Repo): ListedRef[] {
   const out: ListedRef[] = [];
   for (const name of [...repo.refs.keys()].sort()) {
     const oid = repo.refs.get(name)!;
@@ -61,8 +67,9 @@ function listRefs(repo: Repo): ListedRef[] {
   return out;
 }
 
-/** The tip of the default branch, or the zero oid when the repo is unborn. */
-function defaultTip(repo: Repo): string {
+/** The tip of the default branch, or the zero oid when the repo is
+ * unborn. */
+function headTip(repo: Repo): string {
   return repo.refs.get(`refs/heads/${repo.defaultBranch}`) ?? ZERO_OID;
 }
 
@@ -70,7 +77,7 @@ function defaultTip(repo: Repo): string {
 // advertisements
 // ---------------------------------------------------------------------------
 
-function v2Advertisement(): Buffer {
+function advertiseV2(): Buffer {
   return Buffer.concat([
     pktLine('version 2\n'),
     pktLine(`agent=${AGENT}\n`),
@@ -81,35 +88,55 @@ function v2Advertisement(): Buffer {
   ]);
 }
 
-function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+function advertiseV0(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
   const caps = service === 'git-upload-pack' ? UPLOAD_V0_CAPS : RECEIVE_V0_CAPS;
   const chunks: Buffer[] = [pktLine(`# service=${service}\n`), pktFlush()];
-  const refs = listRefs(repo);
+  const refs = collectRefs(repo);
   if (refs.length === 0) {
     chunks.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
   } else {
-    const tip = defaultTip(repo);
+    const tip = headTip(repo);
     chunks.push(pktLine(`${tip} HEAD\0${caps}\n`));
     for (const ref of refs) {
       chunks.push(pktLine(`${ref.oid} ${ref.name}\n`));
-      if (ref.peeled !== undefined) chunks.push(pktLine(`${ref.peeled} ${ref.name}^{}\n`));
+      if (ref.peeled !== undefined) {
+        chunks.push(pktLine(`${ref.peeled} ${ref.name}^{}\n`));
+      }
     }
   }
   chunks.push(pktFlush());
   return Buffer.concat(chunks);
 }
 
-export function handleInfoRefs(store: Store, owner: string, repoName: string, service: string, gitProtocol: string | undefined): HttpResult {
+export function handleInfoRefs(
+  store: Store,
+  owner: string,
+  repoName: string,
+  service: string,
+  gitProtocol: string | undefined,
+): HttpResult {
   const repo = store.getRepo(owner, repoName);
   if (repo === undefined) return notFound();
   if (service === 'git-upload-pack') {
     if (gitProtocol === 'version=2') {
-      return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: v2Advertisement() };
+      return {
+        status: 200,
+        contentType: 'application/x-git-upload-pack-advertisement',
+        body: advertiseV2(),
+      };
     }
-    return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: v0Advertisement(repo, 'git-upload-pack') };
+    return {
+      status: 200,
+      contentType: 'application/x-git-upload-pack-advertisement',
+      body: advertiseV0(repo, 'git-upload-pack'),
+    };
   }
   if (service === 'git-receive-pack') {
-    return { status: 200, contentType: 'application/x-git-receive-pack-advertisement', body: v0Advertisement(repo, 'git-receive-pack') };
+    return {
+      status: 200,
+      contentType: 'application/x-git-receive-pack-advertisement',
+      body: advertiseV0(repo, 'git-receive-pack'),
+    };
   }
   return jsonResult(400, { message: `unknown service ${service}` });
 }
@@ -119,7 +146,7 @@ export function handleInfoRefs(store: Store, owner: string, repoName: string, se
 // ---------------------------------------------------------------------------
 
 /** The text lines of a pkt-line request body (data packets only). */
-function requestLines(body: Buffer): string[] {
+function textLines(body: Buffer): string[] {
   const lines: string[] = [];
   let offset = 0;
   while (offset + 4 <= body.length) {
@@ -129,7 +156,9 @@ function requestLines(body: Buffer): string[] {
       continue;
     }
     const length = Number.parseInt(head, 16);
-    if (!Number.isFinite(length) || length < 4 || offset + length > body.length) throw new Error('bad pkt-line in request');
+    if (!Number.isFinite(length) || length < 4 || offset + length > body.length) {
+      throw new Error('bad pkt-line in request');
+    }
     lines.push(body.subarray(offset + 4, offset + length).toString('utf8'));
     offset += length;
   }
@@ -147,7 +176,7 @@ export interface FetchRequest {
   depth: number | undefined;
 }
 
-function parseFetchLines(lines: readonly string[]): FetchRequest {
+function readFetchRequest(lines: readonly string[]): FetchRequest {
   const out: FetchRequest = { wants: [], haves: [], shallow: [], depth: undefined };
   for (const line of lines) {
     const text = line.replace(/\n$/, '');
@@ -164,111 +193,12 @@ function parseFetchLines(lines: readonly string[]): FetchRequest {
 
 interface FetchPlan {
   objects: GitObject[];
-  newShallow: string[];
-  unshallow: string[];
-}
-
-/** Which objects a fetch sends: the closure of the wants, stopping at haves,
- * at shallow boundaries, and at the deepen limit. A commit at exactly
- * depth-1 generations becomes a new shallow boundary; a previously shallow
- * commit whose parent is now sent stops being one. */
-function planFetch(store: Store, repo: Repo, request: FetchRequest): FetchPlan {
-  const haveSet = new Set(request.haves);
-  const shallowSet = new Set(request.shallow);
-  const depth = request.depth;
-  const send = new Map<string, GitObject>();
-  const sentCommits = new Set<string>();
-  const newShallow: string[] = [];
-  const distance = new Map<string, number>();
-  const queue: Array<[string, number]> = [];
-  for (const want of request.wants) queue.push([want, 0]);
-
-  // Everything reachable from a held commit — a have, or a shallow boundary
-  // the client already holds — is already on the client and must never be
-  // re-sent: not the commit, not its tree, not a shared blob. The walk
-  // stops at a shallow boundary: the client holds that commit and its tree,
-  // but not its parents, and deepening exists to fetch exactly those.
-  const heldObjects = new Set<string>();
-  const markHeld = (oid: string): void => {
-    const object = repo.objects.get(oid);
-    if (object === undefined || heldObjects.has(oid)) return;
-    heldObjects.add(oid);
-    if (object.type === 'commit') {
-      const commit = parseCommit(object.data);
-      markHeld(commit.tree);
-      if (!shallowSet.has(oid)) {
-        for (const parent of commit.parents) markHeld(parent);
-      }
-    } else if (object.type === 'tree') {
-      for (const entry of parseTree(object.data)) markHeld(entry.oid);
-    } else if (object.type === 'tag') {
-      markHeld(parseTag(object.data).object);
-    }
-  };
-  for (const oid of [...request.haves, ...request.shallow]) markHeld(oid);
-
-  const includeTreeClosure = (treeOid: string): void => {
-    const walk = (oid: string): void => {
-      const object = repo.objects.get(oid);
-      if (object === undefined || send.has(oid) || heldObjects.has(oid)) return;
-      send.set(oid, object);
-      if (object.type !== 'tree') return;
-      for (const entry of parseTree(object.data)) walk(entry.oid);
-    };
-    walk(treeOid);
-  };
-
-  while (queue.length > 0) {
-    const [oid, dist] = queue.shift()!;
-    const known = distance.get(oid);
-    if (known !== undefined && known <= dist) continue;
-    distance.set(oid, dist);
-    if (depth !== undefined && dist >= depth) continue;
-    const object = repo.objects.get(oid);
-    if (object === undefined) continue;
-    // A held commit is not re-sent. With a deepen in play its parents may
-    // still be needed; without one its history is already held. A shallow
-    // boundary is held the same way: the client has the commit, just not
-    // its parents, so deepening walks past it.
-    if (object.type === 'commit' && (haveSet.has(oid) || shallowSet.has(oid))) {
-      if (depth !== undefined) {
-        const commit = parseCommit(object.data);
-        for (const parent of commit.parents) queue.push([parent, dist + 1]);
-      }
-      continue;
-    }
-    if (heldObjects.has(oid)) continue;
-    if (object.type === 'tag') {
-      send.set(oid, object);
-      const target = parseTag(object.data).object;
-      if (target !== '') queue.push([target, dist]);
-      continue;
-    }
-    if (object.type !== 'commit') {
-      send.set(oid, object);
-      continue;
-    }
-    send.set(oid, object);
-    sentCommits.add(oid);
-    const commit = parseCommit(object.data);
-    includeTreeClosure(commit.tree);
-    if (depth !== undefined && dist === depth - 1) newShallow.push(oid);
-    for (const parent of commit.parents) queue.push([parent, dist + 1]);
-  }
-
-  const unshallow: string[] = [];
-  if (depth !== undefined) {
-    for (const old of request.shallow) {
-      if (newShallow.includes(old)) continue;
-      const commit = store.readCommit(repo, old);
-      if (commit !== undefined && commit.parents.some((parent) => sentCommits.has(parent))) unshallow.push(old);
-    }
-  }
-  return { objects: [...send.values()], newShallow, unshallow };
+  freshShallow: string[];
+  clearedShallow: string[];
 }
 
 /** Sideband framing: the pack bytes split into band-1 packets. */
-function sidebandPack(pack: Buffer): Buffer {
+function packInSideband(pack: Buffer): Buffer {
   const chunks: Buffer[] = [];
   const CHUNK = 32768;
   for (let offset = 0; offset < pack.length; offset += CHUNK) {
@@ -282,37 +212,145 @@ function sidebandPack(pack: Buffer): Buffer {
   return Buffer.concat(chunks);
 }
 
-function v2FetchResponse(plan: FetchPlan, depth: number | undefined): Buffer {
+function respondV2Fetch(plan: FetchPlan, depth: number | undefined): Buffer {
   const chunks: Buffer[] = [pktLine('acknowledgments\n'), pktLine('NAK\n'), pktDelim()];
   if (depth !== undefined) {
     chunks.push(pktLine('shallow-info\n'));
-    for (const oid of plan.newShallow) chunks.push(pktLine(`shallow ${oid}\n`));
-    for (const oid of plan.unshallow) chunks.push(pktLine(`unshallow ${oid}\n`));
+    for (const oid of plan.freshShallow) chunks.push(pktLine(`shallow ${oid}\n`));
+    for (const oid of plan.clearedShallow) chunks.push(pktLine(`unshallow ${oid}\n`));
     chunks.push(pktDelim());
   }
   chunks.push(pktLine('packfile\n'));
-  chunks.push(sidebandPack(writePack(plan.objects)));
+  chunks.push(packInSideband(writePack(plan.objects)));
   chunks.push(pktFlush());
   return Buffer.concat(chunks);
 }
 
-function v0FetchResponse(plan: FetchPlan, depth: number | undefined): Buffer {
+function respondV0Fetch(plan: FetchPlan, depth: number | undefined): Buffer {
   const chunks: Buffer[] = [pktLine('NAK\n')];
   if (depth !== undefined) {
-    for (const oid of plan.newShallow) chunks.push(pktLine(`shallow ${oid}\n`));
-    for (const oid of plan.unshallow) chunks.push(pktLine(`unshallow ${oid}\n`));
+    for (const oid of plan.freshShallow) chunks.push(pktLine(`shallow ${oid}\n`));
+    for (const oid of plan.clearedShallow) chunks.push(pktLine(`unshallow ${oid}\n`));
   }
-  chunks.push(sidebandPack(writePack(plan.objects)));
+  chunks.push(packInSideband(writePack(plan.objects)));
   chunks.push(pktFlush());
   return Buffer.concat(chunks);
 }
 
-export function handleUploadPack(store: Store, owner: string, repoName: string, body: Buffer, gitProtocol: string | undefined): HttpResult {
+/** Which objects a fetch sends: the closure of the wants, stopping at
+ * haves, at shallow boundaries, and at the deepen limit. A commit at
+ * exactly depth-1 generations becomes a new shallow boundary; a
+ * previously shallow commit whose parent is now sent stops being one. */
+function buildFetchPlan(store: Store, repo: Repo, request: FetchRequest): FetchPlan {
+  const haveSet = new Set(request.haves);
+  const shallowSet = new Set(request.shallow);
+  const depth = request.depth;
+  const outbox = new Map<string, GitObject>();
+  const shippedCommits = new Set<string>();
+  const freshShallow: string[] = [];
+  const depthOf = new Map<string, number>();
+  const pending: Array<[string, number]> = [];
+  for (const want of request.wants) pending.push([want, 0]);
+
+  // Everything reachable from a held commit — a have, or a shallow
+  // boundary the client already holds — is already on the client and must
+  // never be re-sent: not the commit, not its tree, not a shared blob. The
+  // walk stops at a shallow boundary: the client holds that commit and its
+  // tree, but not its parents, and deepening exists to fetch exactly
+  // those.
+  const held = new Set<string>();
+  const markOwned = (oid: string): void => {
+    const object = repo.objects.get(oid);
+    if (object === undefined || held.has(oid)) return;
+    held.add(oid);
+    if (object.type === 'commit') {
+      const commit = parseCommit(object.data);
+      markOwned(commit.tree);
+      if (!shallowSet.has(oid)) {
+        for (const parent of commit.parents) markOwned(parent);
+      }
+    } else if (object.type === 'tree') {
+      for (const entry of parseTree(object.data)) markOwned(entry.oid);
+    } else if (object.type === 'tag') {
+      markOwned(parseTag(object.data).object);
+    }
+  };
+  for (const oid of [...request.haves, ...request.shallow]) markOwned(oid);
+
+  const addTree = (treeOid: string): void => {
+    const walk = (oid: string): void => {
+      const object = repo.objects.get(oid);
+      if (object === undefined || outbox.has(oid) || held.has(oid)) return;
+      outbox.set(oid, object);
+      if (object.type !== 'tree') return;
+      for (const entry of parseTree(object.data)) walk(entry.oid);
+    };
+    walk(treeOid);
+  };
+
+  while (pending.length > 0) {
+    const [oid, dist] = pending.shift()!;
+    const known = depthOf.get(oid);
+    if (known !== undefined && known <= dist) continue;
+    depthOf.set(oid, dist);
+    if (depth !== undefined && dist >= depth) continue;
+    const object = repo.objects.get(oid);
+    if (object === undefined) continue;
+    // A held commit is not re-sent. With a deepen in play its parents may
+    // still be needed; without one its history is already held. A shallow
+    // boundary is held the same way: the client has the commit, just not
+    // its parents, so deepening walks past it.
+    if (object.type === 'commit' && (haveSet.has(oid) || shallowSet.has(oid))) {
+      if (depth !== undefined) {
+        const commit = parseCommit(object.data);
+        for (const parent of commit.parents) pending.push([parent, dist + 1]);
+      }
+      continue;
+    }
+    if (held.has(oid)) continue;
+    if (object.type === 'tag') {
+      outbox.set(oid, object);
+      const target = parseTag(object.data).object;
+      if (target !== '') pending.push([target, dist]);
+      continue;
+    }
+    if (object.type !== 'commit') {
+      outbox.set(oid, object);
+      continue;
+    }
+    outbox.set(oid, object);
+    shippedCommits.add(oid);
+    const commit = parseCommit(object.data);
+    addTree(commit.tree);
+    if (depth !== undefined && dist === depth - 1) freshShallow.push(oid);
+    for (const parent of commit.parents) pending.push([parent, dist + 1]);
+  }
+
+  const clearedShallow: string[] = [];
+  if (depth !== undefined) {
+    for (const old of request.shallow) {
+      if (freshShallow.includes(old)) continue;
+      const commit = store.readCommit(repo, old);
+      if (commit !== undefined && commit.parents.some((parent) => shippedCommits.has(parent))) {
+        clearedShallow.push(old);
+      }
+    }
+  }
+  return { objects: [...outbox.values()], freshShallow, clearedShallow };
+}
+
+export function handleUploadPack(
+  store: Store,
+  owner: string,
+  repoName: string,
+  body: Buffer,
+  gitProtocol: string | undefined,
+): HttpResult {
   const repo = store.getRepo(owner, repoName);
   if (repo === undefined) return notFound();
   let lines: string[];
   try {
-    lines = requestLines(body);
+    lines = textLines(body);
   } catch {
     return jsonResult(400, { message: 'malformed pkt-line request' });
   }
@@ -320,10 +358,12 @@ export function handleUploadPack(store: Store, owner: string, repoName: string, 
   if (gitProtocol === 'version=2') {
     if (command === 'ls-refs') {
       const peel = lines.some((line) => line.trim() === 'peel');
-      const prefixes = lines.filter((line) => line.startsWith('ref-prefix ')).map((line) => line.slice(11).trim());
-      const refs = listRefs(repo);
+      const prefixes = lines
+        .filter((line) => line.startsWith('ref-prefix '))
+        .map((line) => line.slice(11).trim());
+      const refs = collectRefs(repo);
       const chunks: Buffer[] = [];
-      const tip = defaultTip(repo);
+      const tip = headTip(repo);
       const includeHead = prefixes.length === 0 || prefixes.some((prefix) => 'HEAD'.startsWith(prefix));
       if (includeHead) {
         if (tip === ZERO_OID) chunks.push(pktLine('unborn HEAD symref-target:refs/heads/main\n'));
@@ -339,31 +379,31 @@ export function handleUploadPack(store: Store, owner: string, repoName: string, 
       return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(chunks) };
     }
     if (command === 'fetch') {
-      const request = parseFetchLines(lines);
-      const plan = planFetch(store, repo, request);
-      return { status: 200, contentType: 'application/x-git-upload-pack-result', body: v2FetchResponse(plan, request.depth) };
+      const request = readFetchRequest(lines);
+      const plan = buildFetchPlan(store, repo, request);
+      return { status: 200, contentType: 'application/x-git-upload-pack-result', body: respondV2Fetch(plan, request.depth) };
     }
     return jsonResult(400, { message: `unknown v2 command ${command ?? ''}` });
   }
   // v0 fetch.
-  const request = parseFetchLines(lines);
-  const plan = planFetch(store, repo, request);
-  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: v0FetchResponse(plan, request.depth) };
+  const request = readFetchRequest(lines);
+  const plan = buildFetchPlan(store, repo, request);
+  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: respondV0Fetch(plan, request.depth) };
 }
 
 // ---------------------------------------------------------------------------
 // receive-pack
 // ---------------------------------------------------------------------------
 
-interface PushCommand {
+interface RefUpdate {
   oldOid: string;
   newOid: string;
   ref: string;
 }
 
-function parsePushCommands(body: Buffer): { commands: PushCommand[]; capabilities: string; pack: Buffer } {
+function readPush(body: Buffer): { updates: RefUpdate[]; capabilities: string; pack: Buffer } {
   const { packets, rest } = splitAtFlush(body);
-  const commands: PushCommand[] = [];
+  const updates: RefUpdate[] = [];
   let capabilities = '';
   for (const packet of packets) {
     if (packet.kind !== 'data') continue;
@@ -375,21 +415,21 @@ function parsePushCommands(body: Buffer): { commands: PushCommand[]; capabilitie
     }
     const parts = line.split(' ');
     if (parts.length !== 3) continue;
-    commands.push({ oldOid: parts[0]!, newOid: parts[1]!, ref: parts[2]! });
+    updates.push({ oldOid: parts[0]!, newOid: parts[1]!, ref: parts[2]! });
   }
-  return { commands, capabilities, pack: rest };
+  return { updates, capabilities, pack: rest };
 }
 
 export function handleReceivePack(store: Store, owner: string, repoName: string, body: Buffer): HttpResult {
   const repo = store.getRepo(owner, repoName);
   if (repo === undefined) return notFound();
-  let parsed: { commands: PushCommand[]; capabilities: string; pack: Buffer };
+  let parsed: { updates: RefUpdate[]; capabilities: string; pack: Buffer };
   try {
-    parsed = parsePushCommands(body);
+    parsed = readPush(body);
   } catch {
     return jsonResult(400, { message: 'malformed receive-pack request' });
   }
-  const { commands, capabilities, pack } = parsed;
+  const { updates, capabilities, pack } = parsed;
   const sideband = capabilities.split(' ').includes('side-band-64k');
   const reportLines: string[] = [];
   let unpackOk = true;
@@ -407,34 +447,36 @@ export function handleReceivePack(store: Store, owner: string, repoName: string,
   }
   if (!unpackOk) {
     reportLines.push(`unpack ${unpackDetail}\n`);
-    for (const command of commands) reportLines.push(`ng ${command.ref} unpack error\n`);
+    for (const update of updates) reportLines.push(`ng ${update.ref} unpack error\n`);
   } else {
     reportLines.push('unpack ok\n');
-    for (const command of commands) {
-      const current = repo.refs.get(command.ref);
+    for (const update of updates) {
+      const current = repo.refs.get(update.ref);
       let ok = false;
-      if (command.newOid === ZERO_OID) {
+      if (update.newOid === ZERO_OID) {
         // Delete: the ref must exist and the old oid must match.
-        if (current !== undefined && command.oldOid === current) {
-          repo.refs.delete(command.ref);
+        if (current !== undefined && update.oldOid === current) {
+          repo.refs.delete(update.ref);
           ok = true;
         }
       } else if (current === undefined) {
         // Create: the old oid must be zero and the new object must be stored.
-        if (command.oldOid === ZERO_OID && repo.objects.has(command.newOid)) {
-          repo.refs.set(command.ref, command.newOid);
+        if (update.oldOid === ZERO_OID && repo.objects.has(update.newOid)) {
+          repo.refs.set(update.ref, update.newOid);
           ok = true;
         }
-      } else if (command.oldOid === current && store.isAncestor(repo, current, command.newOid)) {
-        repo.refs.set(command.ref, command.newOid);
+      } else if (update.oldOid === current && store.isAncestor(repo, current, update.newOid)) {
+        repo.refs.set(update.ref, update.newOid);
         ok = true;
       }
-      reportLines.push(ok ? `ok ${command.ref}\n` : `ng ${command.ref} non-fast-forward\n`);
+      reportLines.push(ok ? `ok ${update.ref}\n` : `ng ${update.ref} non-fast-forward\n`);
     }
   }
   if (sideband) {
     const chunks: Buffer[] = [];
-    for (const line of reportLines) chunks.push(pktLine(Buffer.concat([Buffer.from([1]), pktLine(line)])));
+    for (const line of reportLines) {
+      chunks.push(pktLine(Buffer.concat([Buffer.from([1]), pktLine(line)])));
+    }
     chunks.push(pktFlush());
     return { status: 200, contentType: 'application/x-git-receive-pack-result', body: Buffer.concat(chunks) };
   }
