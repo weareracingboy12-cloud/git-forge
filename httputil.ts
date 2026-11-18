@@ -1,53 +1,52 @@
-// Shared HTTP plumbing for every surface: the single response shape the
-// handlers return, small JSON answers, and whole-body reading. The app
-// itself adds X-GitHub-Request-Id to each reply before it goes out.
+// Plumbing every surface shares: one reply shape, small JSON replies,
+// and reading a whole request body. The server stamps
+// X-GitHub-Request-Id on each reply before it leaves.
 
 import type { IncomingMessage } from 'node:http';
 
-export interface HttpResult {
+export interface Reply {
   status: number;
   contentType: string;
   body: Buffer;
   headers?: Record<string, string>;
 }
 
-/** The standard 404 JSON answer. */
-export function notFound(message = 'Not Found'): HttpResult {
-  return jsonResult(404, { message });
+/** The usual 404 JSON reply. */
+export function replyNotFound(message = 'Not Found'): Reply {
+  return jsonReply(404, { message });
 }
 
-/** The standard 401 JSON answer. */
-export function unauthorized(message = 'Unauthorized'): HttpResult {
-  return jsonResult(401, { message });
+/** The usual 401 JSON reply. */
+export function replyUnauthorized(message = 'Unauthorized'): Reply {
+  return jsonReply(401, { message });
 }
 
-/** A JSON answer: the payload stringified with one trailing newline. */
-export function jsonResult(status: number, body: unknown, headers: Record<string, string> = {}): HttpResult {
-  const text = JSON.stringify(body);
-  const out: HttpResult = {
+/** A JSON reply: the value stringified, with one trailing newline. */
+export function jsonReply(status: number, value: unknown, extra: Record<string, string> = {}): Reply {
+  const text = JSON.stringify(value);
+  return {
     status,
     contentType: 'application/json; charset=utf-8',
-    body: Buffer.from(`${text}\n`, 'utf8'),
-    headers,
+    body: Buffer.from(text + '\n', 'utf8'),
+    headers: extra,
   };
-  return out;
 }
 
-/** Slurp a request body whole, refusing anything over `maxBytes`
- * (1 MiB unless the caller says otherwise). */
-export function readBody(req: IncomingMessage, maxBytes = 1 << 20): Promise<Buffer> {
+/** Read a request body in full, refusing anything past `limit`
+ * (one mebibyte by default). */
+export function readRequestBody(req: IncomingMessage, limit = 1 << 20): Promise<Buffer> {
   return new Promise<Buffer>((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let total = 0;
-    req.on('data', (piece: Buffer) => {
-      total += piece.length;
-      if (total > maxBytes) {
+    const pieces: Buffer[] = [];
+    let seen = 0;
+    req.on('data', (chunk: Buffer) => {
+      seen += chunk.length;
+      if (seen > limit) {
         reject(new Error('request body too large'));
         return;
       }
-      chunks.push(piece);
+      pieces.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(Buffer.concat(pieces)));
     req.on('error', reject);
   });
 }

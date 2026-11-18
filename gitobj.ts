@@ -1,27 +1,27 @@
 // The git object layer: SHA-1 ids, commit and tree codecs, pack reading
 // and writing (with OFS/REF delta resolution), and pkt-line framing.
-// Everything here is pure bytes in, bytes out; the store owns the objects,
-// the HTTP handlers own the wire.
+// Everything here is pure bytes in, bytes out; the store owns the
+// objects, the HTTP handlers own the wire.
 
 import { inflateSync, deflateSync } from 'node:zlib';
-import { createHash as createCryptoHash } from 'node:crypto';
+import { createHash as makeHash } from 'node:crypto';
 
-export const ZERO_OID = '0000000000000000000000000000000000000000';
+export const EMPTY_OID = '0000000000000000000000000000000000000000';
 
-export type GitObjectType = 'commit' | 'tree' | 'blob' | 'tag';
+export type ObjectKind = 'commit' | 'tree' | 'blob' | 'tag';
 
-export interface GitObject {
-  type: GitObjectType;
+export interface StoredObject {
+  type: ObjectKind;
   data: Buffer;
 }
 
-export interface TreeEntry {
+export interface TreeItem {
   mode: string;
   name: string;
   oid: string;
 }
 
-export interface CommitParts {
+export interface CommitFields {
   tree: string;
   parents: string[];
   author: string;
@@ -30,18 +30,18 @@ export interface CommitParts {
 }
 
 /** The SHA-1 hex of `buffer`. */
-export function sha1hex(buffer: Buffer): string {
-  return createCryptoHash('sha1').update(buffer).digest('hex');
+export function sha1Hex(buffer: Buffer): string {
+  return makeHash('sha1').update(buffer).digest('hex');
 }
 
 /** The object id of a git object: sha1("<type> <length>\0" + data). */
-export function hashObject(type: GitObjectType, data: Buffer): string {
+export function objectId(type: ObjectKind, data: Buffer): string {
   const prefix = Buffer.from(`${type} ${data.length}\0`, 'ascii');
-  return sha1hex(Buffer.concat([prefix, data]));
+  return sha1Hex(Buffer.concat([prefix, data]));
 }
 
 /** Whether `value` is a 40-character hex object id (any case). */
-export function isObjectId(value: string): boolean {
+export function looksLikeOid(value: string): boolean {
   return /^[0-9a-f]{40}$/i.test(value);
 }
 
@@ -49,13 +49,10 @@ export function isObjectId(value: string): boolean {
 // pkt-lines
 // ---------------------------------------------------------------------------
 
-export type GitPacket =
-  | { kind: 'data'; payload: Buffer }
-  | { kind: 'flush' }
-  | { kind: 'delim' };
+export type Packet = { kind: 'data'; payload: Buffer } | { kind: 'flush' } | { kind: 'delim' };
 
 /** Encode one pkt-line carrying `payload` (a string or bytes). */
-export function pktLine(payload: string | Buffer): Buffer {
+export function frameLine(payload: string | Buffer): Buffer {
   const body = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
   const size = body.length + 4;
   const head = Buffer.from(size.toString(16).padStart(4, '0'), 'ascii');
@@ -63,20 +60,20 @@ export function pktLine(payload: string | Buffer): Buffer {
 }
 
 /** The flush packet, `0000`. */
-export function pktFlush(): Buffer {
+export function frameFlush(): Buffer {
   return Buffer.from('0000', 'ascii');
 }
 
 /** The delimiter packet, `0001`. */
-export function pktDelim(): Buffer {
+export function frameDelim(): Buffer {
   return Buffer.from('0001', 'ascii');
 }
 
-/** Parse a buffer of pkt-lines into packets. Throws on a bad length prefix
- * or a truncated line. Returns the packets and the offset where parsing
- * stopped (the byte after the last complete packet). */
-export function parsePktLines(buffer: Buffer): { packets: GitPacket[]; consumed: number } {
-  const packets: GitPacket[] = [];
+/** Parse a buffer of pkt-lines into packets. Throws on a bad length
+ * prefix or a truncated line. Returns the packets and the offset where
+ * parsing stopped (the byte after the last complete packet). */
+export function readFrames(buffer: Buffer): { packets: Packet[]; consumed: number } {
+  const packets: Packet[] = [];
   let at = 0;
   while (at + 4 <= buffer.length) {
     const head = buffer.subarray(at, at + 4).toString('ascii');
@@ -103,9 +100,9 @@ export function parsePktLines(buffer: Buffer): { packets: GitPacket[]; consumed:
 
 /** Split a buffer at the first flush packet: the packets up to and
  * including it, and the bytes after it. */
-export function splitAtFlush(buffer: Buffer): { packets: GitPacket[]; rest: Buffer } {
+export function splitOnFlush(buffer: Buffer): { packets: Packet[]; rest: Buffer } {
   let at = 0;
-  const packets: GitPacket[] = [];
+  const packets: Packet[] = [];
   while (at + 4 <= buffer.length) {
     const head = buffer.subarray(at, at + 4).toString('ascii');
     if (head === '0000') {
@@ -132,15 +129,15 @@ export function splitAtFlush(buffer: Buffer): { packets: GitPacket[]; rest: Buff
 // ---------------------------------------------------------------------------
 
 /** Parse a commit object's bytes into its parts. The message is the text
- * after the blank line, with one trailing newline stripped (git stores the
- * message with a trailing newline; the API shows it without). */
-export function parseCommit(data: Buffer): CommitParts {
+ * after the blank line, with one trailing newline stripped (git stores
+ * the message with a trailing newline; the API shows it without). */
+export function decodeCommit(data: Buffer): CommitFields {
   const text = data.toString('utf8');
   const gap = text.indexOf('\n\n');
   const head = gap === -1 ? text : text.slice(0, gap);
   let message = gap === -1 ? '' : text.slice(gap + 2);
   if (message.endsWith('\n')) message = message.slice(0, -1);
-  const parts: CommitParts = { tree: '', parents: [], author: '', committer: '', message };
+  const parts: CommitFields = { tree: '', parents: [], author: '', committer: '', message };
   for (const line of head.split('\n')) {
     if (line.startsWith('tree ')) parts.tree = line.slice(5).trim();
     else if (line.startsWith('parent ')) parts.parents.push(line.slice(7).trim());
@@ -152,7 +149,7 @@ export function parseCommit(data: Buffer): CommitParts {
 
 /** Build a commit object's bytes. `message` is stored with a trailing
  * newline, as git writes it. */
-export function buildCommit(parts: CommitParts): Buffer {
+export function encodeCommit(parts: CommitFields): Buffer {
   const lines: string[] = [`tree ${parts.tree}`];
   for (const parent of parts.parents) lines.push(`parent ${parent}`);
   lines.push(`author ${parts.author}`);
@@ -160,9 +157,9 @@ export function buildCommit(parts: CommitParts): Buffer {
   return Buffer.from(`${lines.join('\n')}\n\n${parts.message}\n`, 'utf8');
 }
 
-/** Parse a tag object's bytes: object, type, tag name and tagger, then the
- * message after the blank line. */
-export function parseTag(data: Buffer): { object: string; type: string; tag: string; message: string } {
+/** Parse a tag object's bytes: object, type, tag name and tagger, then
+ * the message after the blank line. */
+export function decodeTag(data: Buffer): { object: string; type: string; tag: string; message: string } {
   const text = data.toString('utf8');
   const gap = text.indexOf('\n\n');
   const head = gap === -1 ? text : text.slice(0, gap);
@@ -181,8 +178,8 @@ export function parseTag(data: Buffer): { object: string; type: string; tag: str
 // ---------------------------------------------------------------------------
 
 /** Parse a tree object's bytes into entries, in stored order. */
-export function parseTree(data: Buffer): TreeEntry[] {
-  const entries: TreeEntry[] = [];
+export function decodeTree(data: Buffer): TreeItem[] {
+  const entries: TreeItem[] = [];
   let at = 0;
   while (at < data.length) {
     const space = data.indexOf(0x20, at);
@@ -200,15 +197,15 @@ export function parseTree(data: Buffer): TreeEntry[] {
 
 /** Git's tree sort: entries compare by name, with a directory's name
  * treated as if it ended in '/'. */
-export function treeSortKey(entry: TreeEntry): string {
+export function treeOrderKey(entry: TreeItem): string {
   return entry.mode === '40000' ? `${entry.name}/` : entry.name;
 }
 
 /** Build a tree object's bytes from entries, sorted git's way. */
-export function buildTree(entries: readonly TreeEntry[]): Buffer {
+export function encodeTree(entries: readonly TreeItem[]): Buffer {
   const sorted = [...entries].sort((a, b) => {
-    const ka = treeSortKey(a);
-    const kb = treeSortKey(b);
+    const ka = treeOrderKey(a);
+    const kb = treeOrderKey(b);
     return ka < kb ? -1 : ka > kb ? 1 : 0;
   });
   const chunks: Buffer[] = [];
@@ -223,13 +220,13 @@ export function buildTree(entries: readonly TreeEntry[]): Buffer {
 // packs
 // ---------------------------------------------------------------------------
 
-interface PackEntry {
-  type: GitObjectType;
+interface PackItem {
+  type: ObjectKind;
   data: Buffer;
   deltaBase?: string | number;
 }
 
-const PACK_TYPES: Record<number, GitObjectType | 'ofs-delta' | 'ref-delta'> = {
+const PACK_KINDS: Record<number, ObjectKind | 'ofs-delta' | 'ref-delta'> = {
   1: 'commit',
   2: 'tree',
   3: 'blob',
@@ -238,10 +235,11 @@ const PACK_TYPES: Record<number, GitObjectType | 'ofs-delta' | 'ref-delta'> = {
   7: 'ref-delta',
 };
 
-/** Read one pack entry header: the first byte carries the type in bits 4-6
- * and the low 4 bits of the size; each following byte carries 7 more size
- * bits, starting at shift 4. Returns [typeNumber, size, nextOffset]. */
-function readPackEntryHeader(data: Buffer, offset: number): [number, number, number] {
+/** Read one pack entry header: the first byte carries the type in bits
+ * 4-6 and the low 4 bits of the size; each following byte carries 7 more
+ * size bits, starting at shift 4. Returns [typeNumber, size,
+ * nextOffset]. */
+function readEntryHeader(data: Buffer, offset: number): [number, number, number] {
   let byte = data[offset]!;
   const typeNumber = (byte >> 4) & 0x7;
   let size = byte & 0x0f;
@@ -257,7 +255,7 @@ function readPackEntryHeader(data: Buffer, offset: number): [number, number, num
 }
 
 /** Adler-32, the checksum a zlib stream ends with. */
-function adler32(buffer: Buffer): number {
+function adlerChecksum(buffer: Buffer): number {
   let a = 1;
   let b = 0;
   for (const byte of buffer) {
@@ -272,11 +270,11 @@ function adler32(buffer: Buffer): number {
  * the end of one stream and ignores what follows, so the stream is
  * inflated once for its bytes; its end is the Adler-32 tail of those
  * bytes, verified by a second inflation of exactly that span. */
-function packInflatedLength(pack: Buffer, start: number, expectedSize: number): number {
+function zlibStreamLength(pack: Buffer, start: number, expectedSize: number): number {
   const inflated = inflateSync(pack.subarray(start));
   if (inflated.length !== expectedSize) throw new Error('pack entry decompresses to the wrong size');
   const tail = Buffer.alloc(4);
-  tail.writeUInt32BE(adler32(inflated));
+  tail.writeUInt32BE(adlerChecksum(inflated));
   let from = start + 2;
   for (;;) {
     const hit = pack.indexOf(tail, from);
@@ -292,8 +290,9 @@ function packInflatedLength(pack: Buffer, start: number, expectedSize: number): 
   }
 }
 
-/** Apply a git delta to `base`, returning the reconstructed object bytes. */
-export function applyDelta(base: Buffer, delta: Buffer): Buffer {
+/** Apply a git delta to `base`, returning the reconstructed object
+ * bytes. */
+export function applyObjectDelta(base: Buffer, delta: Buffer): Buffer {
   let pos = 0;
   const varint = (): number => {
     let value = 0;
@@ -345,34 +344,34 @@ export function applyDelta(base: Buffer, delta: Buffer): Buffer {
   return Buffer.concat(parts);
 }
 
-export interface ReadPackResult {
+export interface PackContents {
   version: number;
-  objects: Map<string, GitObject>;
+  objects: Map<string, StoredObject>;
   deltaCount: number;
 }
 
 /** Parse a whole packfile. Deltas are resolved against bases in the same
- * pack (OFS by negative offset, REF by object id). Throws on a bad header,
- * a bad tail checksum, or a truncated entry. */
-export function readPack(pack: Buffer): ReadPackResult {
+ * pack (OFS by negative offset, REF by object id). Throws on a bad
+ * header, a bad tail checksum, or a truncated entry. */
+export function decodePack(pack: Buffer): PackContents {
   if (pack.length < 32) throw new Error('pack too short');
   if (pack.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('pack does not start with PACK');
   const version = pack.readUInt32BE(4);
   if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
   const count = pack.readUInt32BE(8);
   const tail = pack.subarray(pack.length - 20).toString('hex');
-  const actual = sha1hex(pack.subarray(0, pack.length - 20));
+  const actual = sha1Hex(pack.subarray(0, pack.length - 20));
   if (tail !== actual) throw new Error('pack tail checksum mismatch');
-  const objects = new Map<string, GitObject>();
-  const atOffset = new Map<number, GitObject>();
+  const objects = new Map<string, StoredObject>();
+  const atOffset = new Map<number, StoredObject>();
   let deltaCount = 0;
   let pos = 12;
-  const waiting: Array<{ offset: number; type: GitObjectType; data: Buffer; base: string | number }> = [];
+  const waiting: Array<{ offset: number; type: ObjectKind; data: Buffer; base: string | number }> = [];
   for (let index = 0; index < count; index += 1) {
     const entryStart = pos;
-    const [typeNumber, size, afterHeader] = readPackEntryHeader(pack, pos);
+    const [typeNumber, size, afterHeader] = readEntryHeader(pack, pos);
     pos = afterHeader;
-    const kind = PACK_TYPES[typeNumber];
+    const kind = PACK_KINDS[typeNumber];
     if (kind === undefined) throw new Error(`unknown pack object type ${typeNumber}`);
     let base: string | number | undefined;
     if (kind === 'ofs-delta') {
@@ -390,35 +389,36 @@ export function readPack(pack: Buffer): ReadPackResult {
       pos += 20;
     }
     const inflated = inflateSync(pack.subarray(pos));
-    const consumed = packInflatedLength(pack, pos, size);
+    const consumed = zlibStreamLength(pack, pos, size);
     pos += consumed;
     if (kind === 'ofs-delta' || kind === 'ref-delta') {
       deltaCount += 1;
       waiting.push({ offset: entryStart, type: 'blob', data: inflated, base: base as string | number });
       continue;
     }
-    const type = kind as GitObjectType;
-    const oid = hashObject(type, inflated);
+    const type = kind as ObjectKind;
+    const oid = objectId(type, inflated);
     const object = { type, data: inflated };
     objects.set(oid, object);
     atOffset.set(entryStart, object);
   }
   // Resolve deltas in file order; a delta's base may itself be a delta.
-  const fixDelta = (entry: { offset: number; type: GitObjectType; data: Buffer; base: string | number }): GitObject => {
+  const fixDelta = (entry: { offset: number; type: ObjectKind; data: Buffer; base: string | number }): StoredObject => {
     const baseObject = typeof entry.base === 'number' ? atOffset.get(entry.base) : objects.get(entry.base);
     if (baseObject === undefined) throw new Error('delta base not in pack');
-    const data = applyDelta(baseObject.data, entry.data);
+    const data = applyObjectDelta(baseObject.data, entry.data);
     const object = { type: baseObject.type, data };
-    const oid = hashObject(object.type, data);
+    const oid = objectId(object.type, data);
     objects.set(oid, object);
     atOffset.set(entry.offset, object);
     return object;
   };
   for (const entry of waiting) {
-    // A waiting delta whose base is another waiting delta is resolved when
-    // its turn comes only if the base was already resolved; walk the chain.
+    // A waiting delta whose base is another waiting delta is resolved
+    // when its turn comes only if the base was already resolved; walk the
+    // chain.
     const chain: typeof waiting = [];
-    let current: { offset: number; type: GitObjectType; data: Buffer; base: string | number } | undefined = entry;
+    let current: { offset: number; type: ObjectKind; data: Buffer; base: string | number } | undefined = entry;
     const seen = new Set<number>();
     while (current !== undefined && !seen.has(current.offset)) {
       seen.add(current.offset);
@@ -436,8 +436,8 @@ export function readPack(pack: Buffer): ReadPackResult {
 
 /** Write a packfile (version 2) holding `objects` plain, with no deltas:
  * header, one zlib-deflated entry per object, and the SHA-1 tail. */
-export function writePack(objects: readonly GitObject[]): Buffer {
-  const typeNumbers: Record<GitObjectType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
+export function encodePack(objects: readonly StoredObject[]): Buffer {
+  const typeNumbers: Record<ObjectKind, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
   const chunks: Buffer[] = [];
   const header = Buffer.alloc(12);
   header.write('PACK', 0, 'ascii');
@@ -458,6 +458,6 @@ export function writePack(objects: readonly GitObject[]): Buffer {
     chunks.push(deflateSync(object.data));
   }
   const body = Buffer.concat(chunks);
-  const tail = Buffer.from(sha1hex(body), 'hex');
+  const tail = Buffer.from(sha1Hex(body), 'hex');
   return Buffer.concat([body, tail]);
 }

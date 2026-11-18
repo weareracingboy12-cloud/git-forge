@@ -19,46 +19,46 @@
 //   unpacks. The report travels in sideband band 1 when negotiated.
 
 import {
-  ZERO_OID,
-  parseCommit,
-  parseTag,
-  parseTree,
-  pktDelim,
-  pktFlush,
-  pktLine,
-  readPack,
-  splitAtFlush,
-  writePack,
-  type GitObject,
+  EMPTY_OID,
+  decodeCommit,
+  decodeTag,
+  decodeTree,
+  frameDelim,
+  frameFlush,
+  frameLine,
+  decodePack,
+  splitOnFlush,
+  encodePack,
+  type StoredObject,
 } from './gitobj.ts';
-import { Store, type Repo } from './store.ts';
-import { jsonResult, notFound, type HttpResult } from './httputil.ts';
+import { Store, type Repository } from './store.ts';
+import { jsonReply, replyNotFound, type Reply } from './httputil.ts';
 
-const AGENT = 'git-forge/1.0';
+const AGENT_ID = 'git-forge/1.0';
 
-const UPLOAD_V0_CAPS =
+const UPLOAD_CAPS_V0 =
   'side-band-64k multi_ack_detailed thin-pack ofs-delta shallow symref=HEAD:refs/heads/main agent=git-forge/1.0';
-const RECEIVE_V0_CAPS =
+const RECEIVE_CAPS_V0 =
   'report-status side-band-64k delete-refs ofs-delta agent=git-forge/1.0';
 
 /** One ref of a repository, with its peeled tag target when it is an
  * annotated tag. */
-interface ListedRef {
+interface RefListing {
   name: string;
   oid: string;
   peeled?: string;
 }
 
 /** The refs of a repository, sorted by name, with peeled tag targets. */
-function collectRefs(repo: Repo): ListedRef[] {
-  const out: ListedRef[] = [];
+function listRefs(repo: Repository): RefListing[] {
+  const out: RefListing[] = [];
   for (const name of [...repo.refs.keys()].sort()) {
     const oid = repo.refs.get(name)!;
-    const ref: ListedRef = { name, oid };
+    const ref: RefListing = { name, oid };
     if (name.startsWith('refs/tags/')) {
       const object = repo.objects.get(oid);
       if (object !== undefined && object.type === 'tag') {
-        const tag = parseTag(object.data);
+        const tag = decodeTag(object.data);
         if (tag.object !== '') ref.peeled = tag.object;
       }
     }
@@ -69,76 +69,76 @@ function collectRefs(repo: Repo): ListedRef[] {
 
 /** The tip of the default branch, or the zero oid when the repo is
  * unborn. */
-function headTip(repo: Repo): string {
-  return repo.refs.get(`refs/heads/${repo.defaultBranch}`) ?? ZERO_OID;
+function defaultTip(repo: Repository): string {
+  return repo.refs.get(`refs/heads/${repo.mainBranch}`) ?? EMPTY_OID;
 }
 
 // ---------------------------------------------------------------------------
 // advertisements
 // ---------------------------------------------------------------------------
 
-function advertiseV2(): Buffer {
+function v2Advertisement(): Buffer {
   return Buffer.concat([
-    pktLine('version 2\n'),
-    pktLine(`agent=${AGENT}\n`),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow filter\n'),
-    pktLine('object-format=sha1\n'),
-    pktFlush(),
+    frameLine('version 2\n'),
+    frameLine(`agent=${AGENT_ID}\n`),
+    frameLine('ls-refs=unborn\n'),
+    frameLine('fetch=shallow filter\n'),
+    frameLine('object-format=sha1\n'),
+    frameFlush(),
   ]);
 }
 
-function advertiseV0(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
-  const caps = service === 'git-upload-pack' ? UPLOAD_V0_CAPS : RECEIVE_V0_CAPS;
-  const chunks: Buffer[] = [pktLine(`# service=${service}\n`), pktFlush()];
-  const refs = collectRefs(repo);
+function v0Advertisement(repo: Repository, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const caps = service === 'git-upload-pack' ? UPLOAD_CAPS_V0 : RECEIVE_CAPS_V0;
+  const chunks: Buffer[] = [frameLine(`# service=${service}\n`), frameFlush()];
+  const refs = listRefs(repo);
   if (refs.length === 0) {
-    chunks.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
+    chunks.push(frameLine(`${EMPTY_OID} capabilities^{}\0${caps}\n`));
   } else {
-    const tip = headTip(repo);
-    chunks.push(pktLine(`${tip} HEAD\0${caps}\n`));
+    const tip = defaultTip(repo);
+    chunks.push(frameLine(`${tip} HEAD\0${caps}\n`));
     for (const ref of refs) {
-      chunks.push(pktLine(`${ref.oid} ${ref.name}\n`));
+      chunks.push(frameLine(`${ref.oid} ${ref.name}\n`));
       if (ref.peeled !== undefined) {
-        chunks.push(pktLine(`${ref.peeled} ${ref.name}^{}\n`));
+        chunks.push(frameLine(`${ref.peeled} ${ref.name}^{}\n`));
       }
     }
   }
-  chunks.push(pktFlush());
+  chunks.push(frameFlush());
   return Buffer.concat(chunks);
 }
 
-export function handleInfoRefs(
+export function serveInfoRefs(
   store: Store,
   owner: string,
   repoName: string,
   service: string,
   gitProtocol: string | undefined,
-): HttpResult {
-  const repo = store.getRepo(owner, repoName);
-  if (repo === undefined) return notFound();
+): Reply {
+  const repo = store.findRepo(owner, repoName);
+  if (repo === undefined) return replyNotFound();
   if (service === 'git-upload-pack') {
     if (gitProtocol === 'version=2') {
       return {
         status: 200,
         contentType: 'application/x-git-upload-pack-advertisement',
-        body: advertiseV2(),
+        body: v2Advertisement(),
       };
     }
     return {
       status: 200,
       contentType: 'application/x-git-upload-pack-advertisement',
-      body: advertiseV0(repo, 'git-upload-pack'),
+      body: v0Advertisement(repo, 'git-upload-pack'),
     };
   }
   if (service === 'git-receive-pack') {
     return {
       status: 200,
       contentType: 'application/x-git-receive-pack-advertisement',
-      body: advertiseV0(repo, 'git-receive-pack'),
+      body: v0Advertisement(repo, 'git-receive-pack'),
     };
   }
-  return jsonResult(400, { message: `unknown service ${service}` });
+  return jsonReply(400, { message: `unknown service ${service}` });
 }
 
 // ---------------------------------------------------------------------------
@@ -146,7 +146,7 @@ export function handleInfoRefs(
 // ---------------------------------------------------------------------------
 
 /** The text lines of a pkt-line request body (data packets only). */
-function textLines(body: Buffer): string[] {
+function packetTextLines(body: Buffer): string[] {
   const lines: string[] = [];
   let offset = 0;
   while (offset + 4 <= body.length) {
@@ -169,15 +169,15 @@ function textLines(body: Buffer): string[] {
 // fetch
 // ---------------------------------------------------------------------------
 
-export interface FetchRequest {
+export interface FetchAsk {
   wants: string[];
   haves: string[];
   shallow: string[];
   depth: number | undefined;
 }
 
-function readFetchRequest(lines: readonly string[]): FetchRequest {
-  const out: FetchRequest = { wants: [], haves: [], shallow: [], depth: undefined };
+function parseFetchAsk(lines: readonly string[]): FetchAsk {
+  const out: FetchAsk = { wants: [], haves: [], shallow: [], depth: undefined };
   for (const line of lines) {
     const text = line.replace(/\n$/, '');
     if (text.startsWith('want ')) out.wants.push(text.slice(5).trim());
@@ -191,49 +191,49 @@ function readFetchRequest(lines: readonly string[]): FetchRequest {
   return out;
 }
 
-interface FetchPlan {
-  objects: GitObject[];
+interface FetchOutcome {
+  objects: StoredObject[];
   freshShallow: string[];
   clearedShallow: string[];
 }
 
 /** Sideband framing: the pack bytes split into band-1 packets. */
-function packInSideband(pack: Buffer): Buffer {
+function sidebandPack(pack: Buffer): Buffer {
   const chunks: Buffer[] = [];
   const CHUNK = 32768;
   for (let offset = 0; offset < pack.length; offset += CHUNK) {
     const piece = pack.subarray(offset, Math.min(offset + CHUNK, pack.length));
-    chunks.push(pktLine(Buffer.concat([Buffer.from([1]), piece])));
+    chunks.push(frameLine(Buffer.concat([Buffer.from([1]), piece])));
   }
   if (pack.length === 0) {
     // An empty pack is still a pack: send its 32 bytes as one band-1 packet.
-    chunks.push(pktLine(Buffer.concat([Buffer.from([1]), pack])));
+    chunks.push(frameLine(Buffer.concat([Buffer.from([1]), pack])));
   }
   return Buffer.concat(chunks);
 }
 
-function respondV2Fetch(plan: FetchPlan, depth: number | undefined): Buffer {
-  const chunks: Buffer[] = [pktLine('acknowledgments\n'), pktLine('NAK\n'), pktDelim()];
+function v2FetchReply(plan: FetchOutcome, depth: number | undefined): Buffer {
+  const chunks: Buffer[] = [frameLine('acknowledgments\n'), frameLine('NAK\n'), frameDelim()];
   if (depth !== undefined) {
-    chunks.push(pktLine('shallow-info\n'));
-    for (const oid of plan.freshShallow) chunks.push(pktLine(`shallow ${oid}\n`));
-    for (const oid of plan.clearedShallow) chunks.push(pktLine(`unshallow ${oid}\n`));
-    chunks.push(pktDelim());
+    chunks.push(frameLine('shallow-info\n'));
+    for (const oid of plan.freshShallow) chunks.push(frameLine(`shallow ${oid}\n`));
+    for (const oid of plan.clearedShallow) chunks.push(frameLine(`unshallow ${oid}\n`));
+    chunks.push(frameDelim());
   }
-  chunks.push(pktLine('packfile\n'));
-  chunks.push(packInSideband(writePack(plan.objects)));
-  chunks.push(pktFlush());
+  chunks.push(frameLine('packfile\n'));
+  chunks.push(sidebandPack(encodePack(plan.objects)));
+  chunks.push(frameFlush());
   return Buffer.concat(chunks);
 }
 
-function respondV0Fetch(plan: FetchPlan, depth: number | undefined): Buffer {
-  const chunks: Buffer[] = [pktLine('NAK\n')];
+function v0FetchReply(plan: FetchOutcome, depth: number | undefined): Buffer {
+  const chunks: Buffer[] = [frameLine('NAK\n')];
   if (depth !== undefined) {
-    for (const oid of plan.freshShallow) chunks.push(pktLine(`shallow ${oid}\n`));
-    for (const oid of plan.clearedShallow) chunks.push(pktLine(`unshallow ${oid}\n`));
+    for (const oid of plan.freshShallow) chunks.push(frameLine(`shallow ${oid}\n`));
+    for (const oid of plan.clearedShallow) chunks.push(frameLine(`unshallow ${oid}\n`));
   }
-  chunks.push(packInSideband(writePack(plan.objects)));
-  chunks.push(pktFlush());
+  chunks.push(sidebandPack(encodePack(plan.objects)));
+  chunks.push(frameFlush());
   return Buffer.concat(chunks);
 }
 
@@ -241,11 +241,11 @@ function respondV0Fetch(plan: FetchPlan, depth: number | undefined): Buffer {
  * haves, at shallow boundaries, and at the deepen limit. A commit at
  * exactly depth-1 generations becomes a new shallow boundary; a
  * previously shallow commit whose parent is now sent stops being one. */
-function buildFetchPlan(store: Store, repo: Repo, request: FetchRequest): FetchPlan {
+function planFetch(store: Store, repo: Repository, request: FetchAsk): FetchOutcome {
   const haveSet = new Set(request.haves);
   const shallowSet = new Set(request.shallow);
   const depth = request.depth;
-  const outbox = new Map<string, GitObject>();
+  const outbox = new Map<string, StoredObject>();
   const shippedCommits = new Set<string>();
   const freshShallow: string[] = [];
   const depthOf = new Map<string, number>();
@@ -264,15 +264,15 @@ function buildFetchPlan(store: Store, repo: Repo, request: FetchRequest): FetchP
     if (object === undefined || held.has(oid)) return;
     held.add(oid);
     if (object.type === 'commit') {
-      const commit = parseCommit(object.data);
+      const commit = decodeCommit(object.data);
       markOwned(commit.tree);
       if (!shallowSet.has(oid)) {
         for (const parent of commit.parents) markOwned(parent);
       }
     } else if (object.type === 'tree') {
-      for (const entry of parseTree(object.data)) markOwned(entry.oid);
+      for (const entry of decodeTree(object.data)) markOwned(entry.oid);
     } else if (object.type === 'tag') {
-      markOwned(parseTag(object.data).object);
+      markOwned(decodeTag(object.data).object);
     }
   };
   for (const oid of [...request.haves, ...request.shallow]) markOwned(oid);
@@ -283,7 +283,7 @@ function buildFetchPlan(store: Store, repo: Repo, request: FetchRequest): FetchP
       if (object === undefined || outbox.has(oid) || held.has(oid)) return;
       outbox.set(oid, object);
       if (object.type !== 'tree') return;
-      for (const entry of parseTree(object.data)) walk(entry.oid);
+      for (const entry of decodeTree(object.data)) walk(entry.oid);
     };
     walk(treeOid);
   };
@@ -302,7 +302,7 @@ function buildFetchPlan(store: Store, repo: Repo, request: FetchRequest): FetchP
     // its parents, so deepening walks past it.
     if (object.type === 'commit' && (haveSet.has(oid) || shallowSet.has(oid))) {
       if (depth !== undefined) {
-        const commit = parseCommit(object.data);
+        const commit = decodeCommit(object.data);
         for (const parent of commit.parents) pending.push([parent, dist + 1]);
       }
       continue;
@@ -310,7 +310,7 @@ function buildFetchPlan(store: Store, repo: Repo, request: FetchRequest): FetchP
     if (held.has(oid)) continue;
     if (object.type === 'tag') {
       outbox.set(oid, object);
-      const target = parseTag(object.data).object;
+      const target = decodeTag(object.data).object;
       if (target !== '') pending.push([target, dist]);
       continue;
     }
@@ -320,7 +320,7 @@ function buildFetchPlan(store: Store, repo: Repo, request: FetchRequest): FetchP
     }
     outbox.set(oid, object);
     shippedCommits.add(oid);
-    const commit = parseCommit(object.data);
+    const commit = decodeCommit(object.data);
     addTree(commit.tree);
     if (depth !== undefined && dist === depth - 1) freshShallow.push(oid);
     for (const parent of commit.parents) pending.push([parent, dist + 1]);
@@ -330,7 +330,7 @@ function buildFetchPlan(store: Store, repo: Repo, request: FetchRequest): FetchP
   if (depth !== undefined) {
     for (const old of request.shallow) {
       if (freshShallow.includes(old)) continue;
-      const commit = store.readCommit(repo, old);
+      const commit = store.loadCommit(repo, old);
       if (commit !== undefined && commit.parents.some((parent) => shippedCommits.has(parent))) {
         clearedShallow.push(old);
       }
@@ -339,20 +339,20 @@ function buildFetchPlan(store: Store, repo: Repo, request: FetchRequest): FetchP
   return { objects: [...outbox.values()], freshShallow, clearedShallow };
 }
 
-export function handleUploadPack(
+export function serveUploadPack(
   store: Store,
   owner: string,
   repoName: string,
   body: Buffer,
   gitProtocol: string | undefined,
-): HttpResult {
-  const repo = store.getRepo(owner, repoName);
-  if (repo === undefined) return notFound();
+): Reply {
+  const repo = store.findRepo(owner, repoName);
+  if (repo === undefined) return replyNotFound();
   let lines: string[];
   try {
-    lines = textLines(body);
+    lines = packetTextLines(body);
   } catch {
-    return jsonResult(400, { message: 'malformed pkt-line request' });
+    return jsonReply(400, { message: 'malformed pkt-line request' });
   }
   const command = lines.find((line) => line.startsWith('command='))?.slice(8).trim();
   if (gitProtocol === 'version=2') {
@@ -361,49 +361,49 @@ export function handleUploadPack(
       const prefixes = lines
         .filter((line) => line.startsWith('ref-prefix '))
         .map((line) => line.slice(11).trim());
-      const refs = collectRefs(repo);
+      const refs = listRefs(repo);
       const chunks: Buffer[] = [];
-      const tip = headTip(repo);
+      const tip = defaultTip(repo);
       const includeHead = prefixes.length === 0 || prefixes.some((prefix) => 'HEAD'.startsWith(prefix));
       if (includeHead) {
-        if (tip === ZERO_OID) chunks.push(pktLine('unborn HEAD symref-target:refs/heads/main\n'));
-        else chunks.push(pktLine(`${tip} HEAD symref-target:refs/heads/main\n`));
+        if (tip === EMPTY_OID) chunks.push(frameLine('unborn HEAD symref-target:refs/heads/main\n'));
+        else chunks.push(frameLine(`${tip} HEAD symref-target:refs/heads/main\n`));
       }
       for (const ref of refs) {
         if (prefixes.length > 0 && !prefixes.some((prefix) => ref.name.startsWith(prefix))) continue;
         let line = `${ref.oid} ${ref.name}`;
         if (peel && ref.peeled !== undefined) line += ` peeled:${ref.peeled}`;
-        chunks.push(pktLine(`${line}\n`));
+        chunks.push(frameLine(`${line}\n`));
       }
-      chunks.push(pktFlush());
+      chunks.push(frameFlush());
       return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(chunks) };
     }
     if (command === 'fetch') {
-      const request = readFetchRequest(lines);
-      const plan = buildFetchPlan(store, repo, request);
-      return { status: 200, contentType: 'application/x-git-upload-pack-result', body: respondV2Fetch(plan, request.depth) };
+      const request = parseFetchAsk(lines);
+      const plan = planFetch(store, repo, request);
+      return { status: 200, contentType: 'application/x-git-upload-pack-result', body: v2FetchReply(plan, request.depth) };
     }
-    return jsonResult(400, { message: `unknown v2 command ${command ?? ''}` });
+    return jsonReply(400, { message: `unknown v2 command ${command ?? ''}` });
   }
   // v0 fetch.
-  const request = readFetchRequest(lines);
-  const plan = buildFetchPlan(store, repo, request);
-  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: respondV0Fetch(plan, request.depth) };
+  const request = parseFetchAsk(lines);
+  const plan = planFetch(store, repo, request);
+  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: v0FetchReply(plan, request.depth) };
 }
 
 // ---------------------------------------------------------------------------
 // receive-pack
 // ---------------------------------------------------------------------------
 
-interface RefUpdate {
+interface PushUpdate {
   oldOid: string;
   newOid: string;
   ref: string;
 }
 
-function readPush(body: Buffer): { updates: RefUpdate[]; capabilities: string; pack: Buffer } {
-  const { packets, rest } = splitAtFlush(body);
-  const updates: RefUpdate[] = [];
+function parsePush(body: Buffer): { updates: PushUpdate[]; capabilities: string; pack: Buffer } {
+  const { packets, rest } = splitOnFlush(body);
+  const updates: PushUpdate[] = [];
   let capabilities = '';
   for (const packet of packets) {
     if (packet.kind !== 'data') continue;
@@ -420,14 +420,14 @@ function readPush(body: Buffer): { updates: RefUpdate[]; capabilities: string; p
   return { updates, capabilities, pack: rest };
 }
 
-export function handleReceivePack(store: Store, owner: string, repoName: string, body: Buffer): HttpResult {
-  const repo = store.getRepo(owner, repoName);
-  if (repo === undefined) return notFound();
-  let parsed: { updates: RefUpdate[]; capabilities: string; pack: Buffer };
+export function serveReceivePack(store: Store, owner: string, repoName: string, body: Buffer): Reply {
+  const repo = store.findRepo(owner, repoName);
+  if (repo === undefined) return replyNotFound();
+  let parsed: { updates: PushUpdate[]; capabilities: string; pack: Buffer };
   try {
-    parsed = readPush(body);
+    parsed = parsePush(body);
   } catch {
-    return jsonResult(400, { message: 'malformed receive-pack request' });
+    return jsonReply(400, { message: 'malformed receive-pack request' });
   }
   const { updates, capabilities, pack } = parsed;
   const sideband = capabilities.split(' ').includes('side-band-64k');
@@ -436,7 +436,7 @@ export function handleReceivePack(store: Store, owner: string, repoName: string,
   let unpackDetail = '';
   if (pack.length > 0) {
     try {
-      const { objects } = readPack(pack);
+      const { objects } = decodePack(pack);
       for (const [oid, object] of objects) {
         if (!repo.objects.has(oid)) repo.objects.set(oid, object);
       }
@@ -453,7 +453,7 @@ export function handleReceivePack(store: Store, owner: string, repoName: string,
     for (const update of updates) {
       const current = repo.refs.get(update.ref);
       let ok = false;
-      if (update.newOid === ZERO_OID) {
+      if (update.newOid === EMPTY_OID) {
         // Delete: the ref must exist and the old oid must match.
         if (current !== undefined && update.oldOid === current) {
           repo.refs.delete(update.ref);
@@ -461,11 +461,11 @@ export function handleReceivePack(store: Store, owner: string, repoName: string,
         }
       } else if (current === undefined) {
         // Create: the old oid must be zero and the new object must be stored.
-        if (update.oldOid === ZERO_OID && repo.objects.has(update.newOid)) {
+        if (update.oldOid === EMPTY_OID && repo.objects.has(update.newOid)) {
           repo.refs.set(update.ref, update.newOid);
           ok = true;
         }
-      } else if (update.oldOid === current && store.isAncestor(repo, current, update.newOid)) {
+      } else if (update.oldOid === current && store.hasAncestor(repo, current, update.newOid)) {
         repo.refs.set(update.ref, update.newOid);
         ok = true;
       }
@@ -475,12 +475,12 @@ export function handleReceivePack(store: Store, owner: string, repoName: string,
   if (sideband) {
     const chunks: Buffer[] = [];
     for (const line of reportLines) {
-      chunks.push(pktLine(Buffer.concat([Buffer.from([1]), pktLine(line)])));
+      chunks.push(frameLine(Buffer.concat([Buffer.from([1]), frameLine(line)])));
     }
-    chunks.push(pktFlush());
+    chunks.push(frameFlush());
     return { status: 200, contentType: 'application/x-git-receive-pack-result', body: Buffer.concat(chunks) };
   }
-  const chunks = reportLines.map((line) => pktLine(line));
-  chunks.push(pktFlush());
+  const chunks = reportLines.map((line) => frameLine(line));
+  chunks.push(frameFlush());
   return { status: 200, contentType: 'application/x-git-receive-pack-result', body: Buffer.concat(chunks) };
 }
